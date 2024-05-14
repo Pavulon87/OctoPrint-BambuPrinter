@@ -3,6 +3,8 @@ from __future__ import absolute_import
 
 import threading
 import time
+from flask import Flask, Response
+from datetime import datetime
 
 import octoprint.plugin
 from octoprint.events import Events
@@ -14,8 +16,9 @@ class BambuPrintPlugin(octoprint.plugin.SettingsPlugin,
                        octoprint.plugin.TemplatePlugin,
                        octoprint.plugin.AssetPlugin,
                        octoprint.plugin.EventHandlerPlugin,
-                       octoprint.plugin.SimpleApiPlugin):
-
+                       octoprint.plugin.SimpleApiPlugin,
+                       octoprint.plugin.StartupPlugin):
+    serial = None
 
     def get_assets(self):
         return {'js': ["js/bambu_printer.js"]}
@@ -43,6 +46,43 @@ class BambuPrintPlugin(octoprint.plugin.SettingsPlugin,
 
     def is_api_adminonly(self):
         return True
+
+    def gen_stream(self):
+        last_updated = datetime.min
+        chamber_image = self.serial.bambu._device.chamber_image
+        
+        if chamber_image._bytes:
+            while True:
+                if ( last_updated < chamber_image._image_last_updated ):
+                    yield(b'--frame\r\n Content-Type: image/jpeg\r\n\r\n' + chamber_image._bytes + b'\r\n')
+                    last_updated = chamber_image._image_last_updated
+
+                time.sleep(0.5)
+
+    def gen_snap(self):
+        return self.serial.bambu._device.chamber_image._bytes
+
+    def webcam_server(self):
+        stream_server_app = Flask('webcam_server')
+
+        @stream_server_app.route('/stream')
+        @stream_server_app.route('/webstream')
+        def stream():
+            return Response(self.gen_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+        @stream_server_app.route('/snap')
+        @stream_server_app.route('/snapshot')
+        def snapshot():
+            return Response(self.gen_snap(), mimetype='image/jpeg')
+
+        stream_port = self._settings.get(["stream_port"]) if self._settings.get(["stream_port"]) is not None else 5123
+        stream_server_app.run(host='0.0.0.0', port=stream_port, threaded=True, debug=False)
+
+    def on_after_startup(self):
+        self._logger.info( "\nStarting Webcam Server\n" )
+        thread = threading.Thread(target=self.webcam_server)
+        thread.daemon = True
+        thread.start()
 
     def get_api_commands(self):
         return {"register": ["email", "password", "region", "auth_token"]}
@@ -121,6 +161,7 @@ class BambuPrintPlugin(octoprint.plugin.SettingsPlugin,
             read_timeout=float(read_timeout),
             faked_baudrate=baudrate,
         )
+        self.serial = serial_obj
         return serial_obj
 
     def get_additional_port_names(self, *args, **kwargs):
